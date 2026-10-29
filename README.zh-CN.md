@@ -49,7 +49,7 @@ FP16/FP32 比值从 2.87 变成 5.45。完整日志与每卡数据见
 ## 构建
 
 ```powershell
-git clone https://github.com/<you>/rtx30-dual-unlock.git
+git clone https://github.com/qingfeng2018/rtx30-dual-unlock.git
 cd rtx30-dual-unlock
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -LlvmBin C:\LLVM20\bin
 ```

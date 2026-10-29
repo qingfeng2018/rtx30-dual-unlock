@@ -52,7 +52,7 @@ FP16/FP32 ratio goes from 2.87 to 5.45. Full logs and per-card numbers:
 ## Build
 
 ```powershell
-git clone https://github.com/<you>/rtx30-dual-unlock.git
+git clone https://github.com/qingfeng2018/rtx30-dual-unlock.git
 cd rtx30-dual-unlock
 powershell -ExecutionPolicy Bypass -File scripts\build.ps1 -LlvmBin C:\LLVM20\bin
 ```
