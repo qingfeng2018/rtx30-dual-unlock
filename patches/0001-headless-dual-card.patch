@@ -1,0 +1,402 @@
+diff --git a/src/gop/app.c b/src/gop/app.c
+index 777b31a..ff62785 100644
+--- a/src/gop/app.c
++++ b/src/gop/app.c
+@@ -1,5 +1,12 @@
+ #include "cycle.h"
+ #include "../unlock/boot_source.h"
++#include "../unlock/targets.h"
++#ifdef GU_RUNTIME_PROFILE_BUILD
++#include "../unlock/runtime_profile.h"
++#ifdef GU_AUTO_PROFILE
++#include "../probe/probe_profile.h"
++#endif
++#endif
+ #if defined(GC_FULL_FLR)
+ #include "full.h"
+ #ifdef GC_FULL_UNLOCK
+@@ -137,7 +144,7 @@ static EFI_STATUS OpenParent(EFI_HANDLE image, EFI_FILE_PROTOCOL **out) {
+   if (EFI_ERROR(status) || !fs) return EFI_NOT_FOUND;
+   status = fs->OpenVolume(fs, &root);
+   if (EFI_ERROR(status) || !root) return EFI_NOT_FOUND;
+-  status = root->Open(root, &parent, L"\\RTX-UNLOCK", EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
++  status = root->Open(root, &parent, GU_VOLUME_DIR, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
+   status = CloseFile(root, status);
+   if (EFI_ERROR(status)) return CloseFile(parent, status);
+   if (!parent) return EFI_NOT_FOUND;
+@@ -214,6 +221,26 @@ static EFI_STATUS OpenLog(EFI_HANDLE image) {
+   if (!EFI_ERROR(status) && !Report) status = EFI_DEVICE_ERROR;
+   return CloseFile(run, status);
+ }
++static EFI_STATUS Target(GC_CONTEXT *c);
++#ifdef GU_HEADLESS
++/* Headless build: the target card has no console, so isolation means "nothing is
++   bound to the PCI handle at all" instead of "the GOP children were stopped". */
++static EFI_HANDLE HeadlessTarget;
++static BOOLEAN HeadlessIsolated(VOID) {
++  EFI_BOOT_SERVICES *bs = Table->BootServices;
++  EFI_OPEN_PROTOCOL_INFORMATION_ENTRY *entries = NULL;
++  UINTN count = 0;
++  if (!HeadlessTarget) return FALSE;
++  if (EFI_ERROR(bs->OpenProtocolInformation(HeadlessTarget, &PciGuid, &entries, &count)))
++    return FALSE;
++  BOOLEAN clean = TRUE;
++  for (UINTN i = 0; i < count; i++)
++    if (entries[i].Attributes & (EFI_OPEN_PROTOCOL_BY_DRIVER | EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER))
++      clean = FALSE;
++  if (entries) bs->FreePool(entries);
++  return clean;
++}
++#endif
+ static EFI_STATUS Target(GC_CONTEXT *c) {
+   EFI_HANDLE *handles = NULL;
+   UINTN count = 0, matches = 0;
+@@ -232,16 +259,24 @@ static EFI_STATUS Target(GC_CONTEXT *c) {
+     status = pci->Pci.Read(pci, EfiPciIoWidthUint32, 0, 64, cfg);
+     if (EFI_ERROR(status)) break;
+     if ((cfg[0] & 0xffff) != 0x10de || (cfg[2] >> 24) != 3) continue;
+-    matches++;
+-    c->target = handles[i];
+-    c->pci = pci;
+-    c->identity = cfg[0];
+-    c->subsystem = cfg[11];
+-    c->class_revision = cfg[2];
+-    status =
+-        pci->GetLocation(pci, &c->location[0], &c->location[1], &c->location[2], &c->location[3]);
+-    if (!EFI_ERROR(status) &&
+-        !Log("target=%#llx BDF=%zu:%zu:%zu.%zu\n", (unsigned long long)(UINTN)c->target,
++    {
++      UINTN where[4] = {0, 0, 0, 0};
++      status = pci->GetLocation(pci, &where[0], &where[1], &where[2], &where[3]);
++      if (EFI_ERROR(status)) break;
++      /* Per-card build: skip every NVIDIA display device that is not the target BDF. */
++      if ((UINTN)GU_TARGET_BUS != 0xffffU &&
++          (where[0] != 0 || where[1] != (UINTN)GU_TARGET_BUS || where[2] != 0 || where[3] != 0))
++        continue;
++      matches++;
++      c->target = handles[i];
++      c->pci = pci;
++      c->identity = cfg[0];
++      c->subsystem = cfg[11];
++      c->class_revision = cfg[2];
++      for (UINTN k = 0; k < 4; k++) c->location[k] = where[k];
++    }
++    status = EFI_SUCCESS;
++    if (!Log("target=%#llx BDF=%zu:%zu:%zu.%zu\n", (unsigned long long)(UINTN)c->target,
+              (size_t)c->location[0], (size_t)c->location[1], (size_t)c->location[2],
+              (size_t)c->location[3]))
+       status = EFI_DEVICE_ERROR;
+@@ -424,6 +459,14 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
+   status = table->RuntimeServices->GetVariable(L"SecureBoot", &GlobalGuid, NULL, &size, &secure);
+   Log("STAGE secure-boot query=%#llx bytes=%zu enabled=%u\n", (unsigned long long)status,
+       (size_t)size, secure);
++  if (status == EFI_NOT_FOUND) {
++    /* Boards that never publish SecureBoot: absence means Secure Boot is not enabled. */
++    secure = 0;
++    size = 1;
++    status = EFI_SUCCESS;
++    if (!Log("SECURE_BOOT_ABSENT: no SecureBoot variable; continuing as disabled\n"))
++      status = EFI_DEVICE_ERROR;
++  }
+   if (EFI_ERROR(status) || size != 1 || secure) {
+     status = EFI_SECURITY_VIOLATION;
+     goto finish;
+@@ -477,10 +520,12 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
+     goto finish;
+   }
+ #ifndef GU_SSD_EXPERIMENT
++#ifndef GU_HEADLESS
+   stage = "full-prepare";
+   status = GfPrepare(&context, approved);
+   if (EFI_ERROR(status)) goto finish;
+ #endif
++#endif
+ #ifdef GC_FULL_UNLOCK
+   status = Say(
+ #ifdef GC_PRODUCTION
+@@ -547,12 +592,42 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
+   }
+ #endif
+   stage = "full-stop-flr-restore";
++#ifdef GU_HEADLESS
++  {
++    stage = "headless-detach";
++    status = table->BootServices->DisconnectController(context.target, NULL, NULL);
++    if (!Log("HEADLESS_DISCONNECT status=%#llx\n", (unsigned long long)status)) goto stop;
++    if (EFI_ERROR(status)) goto finish;
++    stage = "headless-claim";
++    EFI_PCI_IO_PROTOCOL *claimed = NULL;
++    status = table->BootServices->OpenProtocol(context.target, &PciGuid, (VOID **)&claimed, image,
++                                               NULL, EFI_OPEN_PROTOCOL_EXCLUSIVE);
++    if (!EFI_ERROR(status) && claimed != context.pci) status = EFI_COMPROMISED_DATA;
++    if (!Log("HEADLESS_CLAIM status=%#llx exclusive=%u\n", (unsigned long long)status,
++             (unsigned)(claimed == context.pci)))
++      goto stop;
++    if (EFI_ERROR(status)) goto finish;
++    HeadlessTarget = context.target;
++    stage = "headless-patch";
++    status = GxPatch(HeadlessIsolated);
++    EFI_STATUS released =
++        table->BootServices->CloseProtocol(context.target, &PciGuid, image, NULL);
++    result.touched = TRUE;
++    if (!EFI_ERROR(status) && EFI_ERROR(released)) status = released;
++    result.restored = !EFI_ERROR(status);
++    if (!Log("HEADLESS_PATCH status=%#llx safe=%u released=%#llx\n", (unsigned long long)status,
++             GxSafe(), (unsigned long long)released))
++      goto stop;
++    if (EFI_ERROR(status)) goto stop;
++  }
++#else
+   status = GfRun(&context, approved, &result);
+   Log("FULL_FINAL status=%#llx touched=%u restored=%u\n", (unsigned long long)status,
+       result.touched, result.restored);
+ #ifdef GC_FULL_UNLOCK
+   if (result.touched && EFI_ERROR(status)) goto stop;
+ #endif
++#endif
+ #elif defined(GC_LEAF_ONLY)
+   stage = "leaf-prepare";
+   status = GcLeafPrepare(&context, &approved);
+@@ -691,9 +766,17 @@ EFI_STATUS EFIAPI efi_main(EFI_HANDLE image, EFI_SYSTEM_TABLE *table) {
+ #else
+     EFI_STATUS closed = Report->Close(Report);
+     Report = NULL;
++#ifdef GU_CHAIN
++    /* Per-card build under a launcher: hand control back so the next card can run. */
++    if (EFI_ERROR(closed)) Halt();
++    Say(L"CARD DONE: selectors written and verified. Returning to the launcher.\r\n");
++    Table->BootServices->Stall(3000000);
++    return EFI_SUCCESS;
++#else
+     if (EFI_ERROR(closed)) Halt();
+     Say(L"REPORT SAVED. Power off now before any further experiment.\r\n");
+     Halt();
++#endif
+ #endif
+   }
+ #endif
+diff --git a/src/launcher/launcher.c b/src/launcher/launcher.c
+new file mode 100644
+index 0000000..c39a0fe
+--- /dev/null
++++ b/src/launcher/launcher.c
+@@ -0,0 +1,129 @@
++/* RTX30 dual-card launcher: runs one unlock child per target card, in order.
++   Children are the same build with a different -DGU_TARGET_BUS / GU_DIR_x. */
++#include <Uefi.h>
++#include <Protocol/LoadedImage.h>
++#include <Protocol/DevicePath.h>
++
++#define CHILD_COUNT 2
++
++static EFI_SYSTEM_TABLE *ST;
++static EFI_HANDLE ImageHandle;
++
++static CHAR16 *Children[CHILD_COUNT] = {L"\\EFI\\BOOT\\RTX30-2.EFI", L"\\EFI\\BOOT\\RTX30-3.EFI"};
++
++static VOID Say(CHAR16 *Text) {
++  if (ST && ST->ConOut && ST->ConOut->OutputString) ST->ConOut->OutputString(ST->ConOut, Text);
++}
++
++static VOID SayStatus(EFI_STATUS Status) {
++  static const CHAR16 Digits[] = L"0123456789abcdef";
++  CHAR16 Buffer[] = L"0x0000000000000000\r\n";
++  for (UINTN i = 0; i < 16; i++) Buffer[2 + i] = Digits[((UINT64)Status >> ((15 - i) * 4)) & 15];
++  Say(Buffer);
++}
++
++static UINTN TextLength(const CHAR16 *Text) {
++  UINTN n = 0;
++  while (Text[n]) n++;
++  return n;
++}
++
++static UINTN NodeLength(const EFI_DEVICE_PATH_PROTOCOL *Node) {
++  return (UINTN)Node->Length[0] | ((UINTN)Node->Length[1] << 8);
++}
++
++/* Append a file path node to the volume device path, which is what LoadImage expects. */
++static EFI_STATUS BuildFilepath(EFI_DEVICE_PATH_PROTOCOL *VolumePath, const CHAR16 *Name,
++                                EFI_DEVICE_PATH_PROTOCOL **Out) {
++  UINT8 *Raw = (UINT8 *)VolumePath;
++  UINTN Offset = 0;
++  BOOLEAN Ended = FALSE;
++  for (UINTN i = 0; i < 64; i++) {
++    EFI_DEVICE_PATH_PROTOCOL *Node = (EFI_DEVICE_PATH_PROTOCOL *)(Raw + Offset);
++    UINTN Length = NodeLength(Node);
++    if (Length < 4 || Length > 4096 - Offset) return EFI_VOLUME_CORRUPTED;
++    if (Node->Type == END_DEVICE_PATH_TYPE) {
++      Ended = TRUE;
++      break;
++    }
++    Offset += Length;
++  }
++  if (!Ended || Offset == 0) return EFI_VOLUME_CORRUPTED;
++
++  UINTN Chars = TextLength(Name) + 1;
++  UINTN NameBytes = Chars * sizeof(CHAR16);
++  UINTN FileNodeLength = 4 + NameBytes;
++  UINTN Total = Offset + FileNodeLength + 4;
++  UINT8 *Buffer = NULL;
++  EFI_STATUS Status = ST->BootServices->AllocatePool(EfiLoaderData, Total, (VOID **)&Buffer);
++  if (EFI_ERROR(Status) || !Buffer) return EFI_OUT_OF_RESOURCES;
++  for (UINTN i = 0; i < Offset; i++) Buffer[i] = Raw[i];
++  UINT8 *Node = Buffer + Offset;
++  Node[0] = 0x04; /* MEDIA_DEVICE_PATH */
++  Node[1] = 0x04; /* MEDIA_FILEPATH_DP */
++  Node[2] = (UINT8)(FileNodeLength & 0xff);
++  Node[3] = (UINT8)(FileNodeLength >> 8);
++  for (UINTN i = 0; i < Chars; i++) {
++    Node[4 + i * 2] = (UINT8)(Name[i] & 0xff);
++    Node[5 + i * 2] = (UINT8)((Name[i] >> 8) & 0xff);
++  }
++  UINT8 *End = Node + FileNodeLength;
++  End[0] = 0x7f; /* END_DEVICE_PATH_TYPE */
++  End[1] = 0xff; /* END_ENTIRE_DEVICE_PATH_SUBTYPE */
++  End[2] = 4;
++  End[3] = 0;
++  *Out = (EFI_DEVICE_PATH_PROTOCOL *)Buffer;
++  return EFI_SUCCESS;
++}
++
++static EFI_STATUS RunChild(EFI_DEVICE_PATH_PROTOCOL *VolumePath, const CHAR16 *Name) {
++  EFI_DEVICE_PATH_PROTOCOL *Path = NULL;
++  EFI_STATUS Status = BuildFilepath(VolumePath, Name, &Path);
++  if (EFI_ERROR(Status)) return Status;
++  EFI_HANDLE Child = NULL;
++  Status = ST->BootServices->LoadImage(FALSE, ImageHandle, Path, NULL, 0, &Child);
++  ST->BootServices->FreePool(Path);
++  if (EFI_ERROR(Status) || !Child) return EFI_ERROR(Status) ? Status : EFI_LOAD_ERROR;
++  return ST->BootServices->StartImage(Child, NULL, NULL);
++}
++
++EFI_STATUS EFIAPI efi_main(EFI_HANDLE Image, EFI_SYSTEM_TABLE *Table) {
++  ST = Table;
++  ImageHandle = Image;
++  Say(L"\r\nRTX30 dual-card launcher v1\r\n"
++      L"Two passes in this power cycle, one per RTX 3080. Do not remove the USB.\r\n");
++  EFI_GUID LoadedGuid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
++  EFI_GUID PathGuid = EFI_DEVICE_PATH_PROTOCOL_GUID;
++  EFI_LOADED_IMAGE_PROTOCOL *Loaded = NULL;
++  EFI_STATUS Status = Table->BootServices->HandleProtocol(Image, &LoadedGuid, (VOID **)&Loaded);
++  if (EFI_ERROR(Status) || !Loaded || !Loaded->DeviceHandle) {
++    Say(L"launcher: no loaded-image device\r\n");
++    return EFI_ERROR(Status) ? Status : EFI_NOT_FOUND;
++  }
++  EFI_DEVICE_PATH_PROTOCOL *VolumePath = NULL;
++  Status = Table->BootServices->HandleProtocol(Loaded->DeviceHandle, &PathGuid,
++                                               (VOID **)&VolumePath);
++  if (EFI_ERROR(Status) || !VolumePath) {
++    Say(L"launcher: no volume device path\r\n");
++    return EFI_ERROR(Status) ? Status : EFI_NOT_FOUND;
++  }
++  for (UINTN i = 0; i < CHILD_COUNT; i++) {
++    CHAR16 Line[] = L"pass X of 2: loading child\r\n";
++    Line[5] = (CHAR16)(L'1' + i);
++    Say(Line);
++    Status = RunChild(VolumePath, Children[i]);
++    if (EFI_ERROR(Status)) {
++      CHAR16 Failed[] = L"pass X failed, status ";
++      Failed[5] = (CHAR16)(L'1' + i);
++      Say(Failed);
++      SayStatus(Status);
++      Say(L"Stop here: power off physically, do not continue into Windows.\r\n");
++      return Status;
++    }
++    Say(L"pass finished without error\r\n");
++  }
++  Say(L"Both passes completed. Returning to firmware: choose Windows Boot Manager now.\r\n"
++      L"Do not reboot; a reboot discards the unlock.\r\n");
++  Table->BootServices->Stall(5000000);
++  return EFI_SUCCESS;
++}
+diff --git a/src/probe/probe_app.c b/src/probe/probe_app.c
+index c4c2f74..3ebf0d2 100644
+--- a/src/probe/probe_app.c
++++ b/src/probe/probe_app.c
+@@ -5,6 +5,7 @@
+ #include <Protocol/GraphicsOutput.h>
+ #include <Guid/FileInfo.h>
+ #include "../unlock/sha256.h"
++#include "../unlock/targets.h"
+ 
+ static EFI_GUID PciGuid = EFI_PCI_IO_PROTOCOL_GUID;
+ static EFI_GUID LoadedGuid = EFI_LOADED_IMAGE_PROTOCOL_GUID;
+@@ -336,10 +337,14 @@ static EFI_STATUS Capture(EFI_HANDLE Image, EFI_SYSTEM_TABLE *Table, EFI_FILE_PR
+         continue;
+       }
+       if (!ProbeMatches(Config)) continue;
+-      Section("PCI", Matches);
+       Status = Pci->GetLocation(Pci, &Segment, &Bus, &Device, &Function);
+       if (Status != EFI_SUCCESS || Segment > 65535 || Bus > 255 || Device > 31 || Function > 7)
+         Evidence = EFI_UNSUPPORTED;
++      /* Per-card build: ignore every other NVIDIA display device on this bus filter. */
++      if ((UINTN)GU_TARGET_BUS != 0xffffU &&
++          (Segment != 0 || Bus != (UINTN)GU_TARGET_BUS || Device != 0 || Function != 0))
++        continue;
++      Section("PCI", Matches);
+       for (UINTN J = 0; J < 64; J++)
+         SelectedConfig[J] = Config[J];
+       Hex("location_status", Status);
+diff --git a/src/unlock/app.c b/src/unlock/app.c
+index a6ea060..30aa520 100644
+--- a/src/unlock/app.c
++++ b/src/unlock/app.c
+@@ -358,9 +358,16 @@ static EFI_STATUS ColdCheck(VOID) {
+   GuLog("cold state: chip=%#x plm=%#x gfw=%#x/%#x/%#x WPR2_HI=%#x SS0=%#x SS1=%#x\n", GU_BOARD_CHIP,
+         plm, s.plm, s.boot, s.cpuctl, hi, ss0, ss1);
+   if (Gu.fault || gpu_unlock_gfw_assess(&s) || hi >> 4 || plm != GU_INITIAL_PLM ||
++#ifdef GU_HEADLESS
++      /* These cards latch a slightly different SS0 on every cold boot (observed
++         0x24156024 -> 0x24156020), so an exact match is a guaranteed false failure.
++         Require only a programmed, not-yet-unlocked selector. */
++      (ss0 == 0xffffffffU || ss1 == 0xffffffffU || ss0 == 0x88888888U) ||
++#else
+ #ifndef GU_SSD_EXPERIMENT
+       ss0 != GU_INITIAL_SS0 ||
+       (GU_PROFILE_BUILD ? ss1 != GU_INITIAL_SS1 : (ss1 != 2 && ss1 != 3)) ||
++#endif
+ #endif
+       GuRead32(0x1183a4) != GU_FB_MIB)
+     return EFI_NOT_READY;
+diff --git a/src/unlock/app_io.c b/src/unlock/app_io.c
+index f094807..87b12a6 100644
+--- a/src/unlock/app_io.c
++++ b/src/unlock/app_io.c
+@@ -1,6 +1,7 @@
+ #include "app_io.h"
+ #include "compat/compat.h"
+ #include "boot_source.h"
++#include "targets.h"
+ #include "format.h"
+ #include "sha256.h"
+ #include <Protocol/LoadedImage.h>
+@@ -115,7 +116,7 @@ static EFI_STATUS IoOpen(EFI_HANDLE Image, EFI_SYSTEM_TABLE *St, BOOLEAN Shared,
+   if (EFI_ERROR(status) || !fs) return EFI_UNSUPPORTED;
+   status = fs->OpenVolume(fs, &Root);
+   if (EFI_ERROR(status) || !Root) return EFI_DEVICE_ERROR;
+-  status = Root->Open(Root, &Parent, L"\\RTX-UNLOCK", EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
++  status = Root->Open(Root, &Parent, GU_VOLUME_DIR, EFI_FILE_MODE_READ | EFI_FILE_MODE_WRITE, 0);
+   if (EFI_ERROR(status) || !Parent) return EFI_NOT_FOUND;
+   status = Metadata(Parent, TRUE, 0);
+   if (EFI_ERROR(status)) return status;
+diff --git a/src/unlock/targets.h b/src/unlock/targets.h
+new file mode 100644
+index 0000000..0a5a210
+--- /dev/null
++++ b/src/unlock/targets.h
+@@ -0,0 +1,14 @@
++#pragma once
++/* Per-card build targeting.
++   GU_TARGET_BUS 0xffff keeps the stock "any location" behaviour.
++   GU_DIR_A / GU_DIR_B select a per-card payload directory on the boot volume. */
++#ifndef GU_TARGET_BUS
++#define GU_TARGET_BUS 0xffffU
++#endif
++#if defined(GU_DIR_A)
++#define GU_VOLUME_DIR L"\\RTX-UNLOCK-A"
++#elif defined(GU_DIR_B)
++#define GU_VOLUME_DIR L"\\RTX-UNLOCK-B"
++#else
++#define GU_VOLUME_DIR L"\\RTX-UNLOCK"
++#endif
